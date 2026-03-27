@@ -1,30 +1,49 @@
 # rust-dtls
 
-Черновой Rust-порт пары программ `client/server` из Go-примера.
+Rust-реализация UDP-forwarder пары `client/server` под ваш сценарий (с сохранением UDP/QUIC трафика).
 
-## Что уже есть
+## Client
 
-- Бинарник `client`:
-  - парсит аргументы (`--vk-link` или `--yandex-link`, `--peer`, `--listen` и т.д.);
-  - запрашивает TURN-креды для VK и Yandex Telemost;
-  - поднимает базовый UDP relay (локальный сокет <-> `--peer`).
-- Бинарник `server`:
-  - поднимает базовый UDP relay (`--listen` <-> `--connect`).
+- По умолчанию слушает: `127.0.0.1:10000`.
+- По умолчанию форвардит в: `217.28.222.148:443`.
+- Получает TURN-креды Telemost через:
+  1. `GET https://cloud-api.yandex.ru/.../connection`
+  2. WebSocket HELLO (`offerAnswerMode=["SEPARATE"]`) с `Origin` и `User-Agent`.
+- После получения TURN-кредов поднимает UDP forwarder в стиле вашего Python-примера:
+  - local socket принимает от клиента;
+  - remote socket `connect()` к target;
+  - двунаправленный relay без изменения payload (QUIC-friendly).
 
-## Ограничения текущего этапа
-
-- DTLS-обфускация пока **не реализована** (в `client` и `server` выводится предупреждение).
-- Полноценный TURN Allocate/Auth pipeline пока **не реализован** (в `client` креды получаются, но трафик пока идет напрямую в `--peer`).
-
-## Запуск
-
-```bash
-cargo run --bin server -- --listen 0.0.0.0:56000 --connect 1.2.3.4:9001
-```
+Запуск:
 
 ```bash
 cargo run --bin client -- \
-  --listen 127.0.0.1:9000 \
-  --peer 1.2.3.4:56000 \
-  --vk-link "https://vk.com/call/join/XXXX"
+  --yandex-link "https://telemost.yandex.ru/j/00057695313831"
+```
+
+Опционально можно переопределить:
+
+```bash
+cargo run --bin client -- \
+  --yandex-link "https://telemost.yandex.ru/j/00057695313831" \
+  --listen-host 127.0.0.1 --listen-port 10000 \
+  --target-ip 217.28.222.148 --target-port 443
+```
+
+## Server
+
+- По умолчанию слушает: `0.0.0.0:8443`.
+- По умолчанию форвардит в: `127.0.0.1:443`.
+- Логика такая же, как у client-forwarder: UDP `recv_from -> send`, `recv -> send_to`.
+
+Запуск:
+
+```bash
+cargo run --bin server --
+```
+
+Или явно:
+
+```bash
+cargo run --bin server -- --listen 0.0.0.0:8443 --connect 127.0.0.1:443
 ```

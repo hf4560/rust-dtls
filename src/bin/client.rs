@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
@@ -10,136 +9,37 @@ use clap::Parser;
 use reqwest::blocking::Client;
 use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE, ORIGIN, REFERER, USER_AGENT};
 use serde::Deserialize;
-use serde_json::Value;
-use tungstenite::connect;
+use serde_json::{json, Value};
+use tungstenite::client::IntoClientRequest;
+use tungstenite::{connect, Message};
 use uuid::Uuid;
 
-const DEFAULT_UA: &str =
+const USER_AGENT_VALUE: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:144.0) Gecko/20100101 Firefox/144.0";
-
-type Creds = (String, String, String);
+const BUF_SIZE: usize = 65_535;
 
 #[derive(Parser, Debug)]
 #[command(name = "client")]
 struct Args {
-    #[arg(long = "turn")]
-    turn_host_override: Option<String>,
-    #[arg(long = "port")]
-    turn_port_override: Option<u16>,
-    #[arg(long = "listen", default_value = "127.0.0.1:9000")]
-    listen_addr: String,
-    #[arg(long = "vk-link")]
-    vk_link: Option<String>,
+    /// Yandex Telemost link: https://telemost.yandex.ru/j/<ID>
     #[arg(long = "yandex-link")]
-    yandex_link: Option<String>,
-    #[arg(long = "peer")]
-    peer_addr: String,
-    #[arg(long = "n")]
-    n_connections: Option<usize>,
-    #[arg(long = "udp", default_value_t = false)]
-    turn_udp: bool,
-    #[arg(long = "no-dtls", default_value_t = false)]
-    no_dtls: bool,
-}
+    yandex_link: String,
 
-fn do_form_post(client: &Client, url: &str, form_body: &str) -> Result<Value> {
-    let mut headers = HeaderMap::new();
-    headers.insert(USER_AGENT, HeaderValue::from_static(DEFAULT_UA));
-    headers.insert(
-        CONTENT_TYPE,
-        HeaderValue::from_static("application/x-www-form-urlencoded"),
-    );
+    /// Local UDP listener for Xray/V2Ray
+    #[arg(long = "listen-host", default_value = "127.0.0.1")]
+    listen_host: String,
 
-    let resp = client
-        .post(url)
-        .headers(headers)
-        .body(form_body.to_owned())
-        .send()
-        .with_context(|| format!("request failed: {url}"))?
-        .error_for_status()
-        .with_context(|| format!("non-success response: {url}"))?;
+    /// Local UDP listener port
+    #[arg(long = "listen-port", default_value_t = 10_000)]
+    listen_port: u16,
 
-    let value = resp.json::<Value>().context("json decode failed")?;
-    Ok(value)
-}
+    /// Upstream target IP for UDP forwarding (QUIC-safe)
+    #[arg(long = "target-ip", default_value = "217.28.222.148")]
+    target_ip: String,
 
-fn get_vk_creds(link: &str) -> Result<Creds> {
-    let client = Client::builder()
-        .timeout(Duration::from_secs(20))
-        .pool_max_idle_per_host(100)
-        .build()
-        .context("failed to build http client")?;
-
-    let body1 = "client_secret=QbYic1K3lEV5kTGiqlq2&client_id=6287487&scopes=audio_anonymous%2Cvideo_anonymous%2Cphotos_anonymous%2Cprofile_anonymous&isApiOauthAnonymEnabled=false&version=1&app_id=6287487";
-    let token1 = do_form_post(&client, "https://login.vk.ru/?act=get_anonym_token", body1)?["data"]
-        ["access_token"]
-        .as_str()
-        .ok_or_else(|| anyhow!("token1 missing"))?
-        .to_owned();
-
-    let body2 = format!("access_token={token1}");
-    let token2 = do_form_post(
-        &client,
-        "https://api.vk.ru/method/calls.getAnonymousAccessTokenPayload?v=5.264&client_id=6287487",
-        &body2,
-    )?["response"]["payload"]
-        .as_str()
-        .ok_or_else(|| anyhow!("token2 missing"))?
-        .to_owned();
-
-    let body3 = format!("client_id=6287487&token_type=messages&payload={token2}&client_secret=QbYic1K3lEV5kTGiqlq2&version=1&app_id=6287487");
-    let token3 = do_form_post(&client, "https://login.vk.ru/?act=get_anonym_token", &body3)?
-        ["data"]["access_token"]
-        .as_str()
-        .ok_or_else(|| anyhow!("token3 missing"))?
-        .to_owned();
-
-    let body4 =
-        format!("vk_join_link=https://vk.com/call/join/{link}&name=123&access_token={token3}");
-    let token4 = do_form_post(
-        &client,
-        "https://api.vk.ru/method/calls.getAnonymousToken?v=5.264",
-        &body4,
-    )?["response"]["token"]
-        .as_str()
-        .ok_or_else(|| anyhow!("token4 missing"))?
-        .to_owned();
-
-    let body5 = format!(
-        "session_data=%7B%22version%22%3A2%2C%22device_id%22%3A%22{}%22%2C%22client_version%22%3A1.1%2C%22client_type%22%3A%22SDK_JS%22%7D&method=auth.anonymLogin&format=JSON&application_key=CGMMEJLGDIHBABABA",
-        Uuid::new_v4()
-    );
-    let token5 = do_form_post(&client, "https://calls.okcdn.ru/fb.do", &body5)?["session_key"]
-        .as_str()
-        .ok_or_else(|| anyhow!("token5 missing"))?
-        .to_owned();
-
-    let body6 = format!(
-        "joinLink={link}&isVideo=false&protocolVersion=5&anonymToken={token4}&method=vchat.joinConversationByLink&format=JSON&application_key=CGMMEJLGDIHBABABA&session_key={token5}"
-    );
-    let resp = do_form_post(&client, "https://calls.okcdn.ru/fb.do", &body6)?;
-
-    let user = resp["turn_server"]["username"]
-        .as_str()
-        .ok_or_else(|| anyhow!("turn user missing"))?
-        .to_owned();
-    let pass = resp["turn_server"]["credential"]
-        .as_str()
-        .ok_or_else(|| anyhow!("turn pass missing"))?
-        .to_owned();
-    let turn_url = resp["turn_server"]["urls"][0]
-        .as_str()
-        .ok_or_else(|| anyhow!("turn url missing"))?;
-
-    let turn_addr = turn_url
-        .split('?')
-        .next()
-        .unwrap_or(turn_url)
-        .trim_start_matches("turn:")
-        .trim_start_matches("turns:")
-        .to_owned();
-
-    Ok((user, pass, turn_addr))
+    /// Upstream target UDP port
+    #[arg(long = "target-port", default_value_t = 443)]
+    target_port: u16,
 }
 
 #[derive(Debug, Deserialize)]
@@ -155,19 +55,22 @@ struct ClientConfiguration {
     media_server_url: String,
 }
 
-fn get_yandex_creds(link: &str) -> Result<Creds> {
+fn extract_telemost_id(link: &str) -> String {
+    let tail = link.split("/j/").last().unwrap_or(link);
+    let mut id = tail.to_owned();
+    if let Some(idx) = id.find(['/', '?', '#']) {
+        id.truncate(idx);
+    }
+    id
+}
+
+fn get_yandex_turn_creds(conference_link_id: &str) -> Result<(String, String, String)> {
     let endpoint = format!(
-        "https://cloud-api.yandex.ru/telemost_front/v2/telemost/conferences/https%3A%2F%2Ftelemost.yandex.ru%2Fj%2F{link}/connection?next_gen_media_platform_allowed=false"
+        "https://cloud-api.yandex.ru/telemost_front/v2/telemost/conferences/https%3A%2F%2Ftelemost.yandex.ru%2Fj%2F{conference_link_id}/connection?next_gen_media_platform_allowed=false"
     );
 
-    let client = Client::builder()
-        .timeout(Duration::from_secs(20))
-        .pool_max_idle_per_host(100)
-        .build()
-        .context("failed to build http client")?;
-
     let mut headers = HeaderMap::new();
-    headers.insert(USER_AGENT, HeaderValue::from_static(DEFAULT_UA));
+    headers.insert(USER_AGENT, HeaderValue::from_static(USER_AGENT_VALUE));
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     headers.insert(
         REFERER,
@@ -179,47 +82,97 @@ fn get_yandex_creds(link: &str) -> Result<Creds> {
     );
     headers.insert(
         "Client-Instance-Id",
-        HeaderValue::from_str(&Uuid::new_v4().to_string()).context("bad client instance id")?,
+        HeaderValue::from_str(&Uuid::new_v4().to_string())
+            .context("invalid Client-Instance-Id header")?,
     );
 
-    let conference = client
+    let client = Client::builder()
+        .timeout(Duration::from_secs(20))
+        .pool_max_idle_per_host(100)
+        .build()
+        .context("failed to build HTTP client")?;
+
+    let response = client
         .get(&endpoint)
         .headers(headers)
         .send()
-        .context("conference request failed")?
+        .context("failed to request conference data")?
         .error_for_status()
-        .context("conference response status error")?
+        .context("conference API returned error status")?
         .json::<ConferenceResponse>()
-        .context("conference decode failed")?;
+        .context("failed to decode conference response")?;
 
-    let ws_url = &conference.client_configuration.media_server_url;
-    let request = format!(
-        r#"{{"uid":"{}","hello":{{"participantMeta":{{"name":"Гость","role":"SPEAKER","description":"","sendAudio":false,"sendVideo":false}},"participantAttributes":{{"name":"Гость","role":"SPEAKER","description":""}},"sendAudio":false,"sendVideo":false,"sendSharing":false,"participantId":"{}","roomId":"{}","serviceName":"telemost","credentials":"{}","sdkInfo":{{"implementation":"browser","version":"5.15.0","userAgent":"{}","hwConcurrency":4}},"sdkInitializationId":"{}","disablePublisher":false,"disableSubscriber":false,"disableSubscriberAudio":false,"capabilitiesOffer":{{"offerAnswerMode":["SEPARATE"],"initialSubscriberOffer":["ON_HELLO"],"slotsMode":["FROM_CONTROLLER"],"simulcastMode":["DISABLED"]}}}}}}"#,
-        Uuid::new_v4(),
-        conference.peer_id,
-        conference.room_id,
-        conference.credentials,
-        DEFAULT_UA,
-        Uuid::new_v4()
+    let hello_request = json!({
+        "uid": Uuid::new_v4().to_string(),
+        "hello": {
+            "participantMeta": {
+                "name": "Гость",
+                "role": "SPEAKER",
+                "description": "",
+                "sendAudio": false,
+                "sendVideo": false
+            },
+            "participantAttributes": {
+                "name": "Гость",
+                "role": "SPEAKER",
+                "description": ""
+            },
+            "sendAudio": false,
+            "sendVideo": false,
+            "sendSharing": false,
+            "participantId": response.peer_id,
+            "roomId": response.room_id,
+            "serviceName": "telemost",
+            "credentials": response.credentials,
+            "sdkInfo": {
+                "implementation": "browser",
+                "version": "5.15.0",
+                "userAgent": USER_AGENT_VALUE,
+                "hwConcurrency": 4
+            },
+            "sdkInitializationId": Uuid::new_v4().to_string(),
+            "disablePublisher": false,
+            "disableSubscriber": false,
+            "disableSubscriberAudio": false,
+            "capabilitiesOffer": {
+                "offerAnswerMode": ["SEPARATE"]
+            }
+        }
+    });
+
+    // WebSocket handshake with explicit headers (matching Python approach).
+    let mut request = response
+        .client_configuration
+        .media_server_url
+        .as_str()
+        .into_client_request()
+        .context("invalid WebSocket URL")?;
+    request.headers_mut().insert(
+        "Origin",
+        HeaderValue::from_static("https://telemost.yandex.ru"),
     );
+    request
+        .headers_mut()
+        .insert(USER_AGENT, HeaderValue::from_static(USER_AGENT_VALUE));
 
-    let (mut ws, _) = connect(ws_url).context("websocket connect failed")?;
-    ws.write_message(tungstenite::Message::Text(request.into()))
-        .context("websocket hello failed")?;
+    let (mut ws, _) = connect(request).context("WebSocket connect failed")?;
+
+    ws.send(Message::Text(hello_request.to_string().into()))
+        .context("failed to send HELLO request")?;
 
     loop {
-        let msg = ws.read_message().context("websocket read failed")?;
+        let msg = ws.read().context("failed to read WebSocket message")?;
         let text = match msg {
-            tungstenite::Message::Text(v) => v,
+            Message::Text(s) => s,
             _ => continue,
         };
 
-        let val: Value = match serde_json::from_str(&text) {
+        let data: Value = match serde_json::from_str(&text) {
             Ok(v) => v,
             Err(_) => continue,
         };
 
-        let Some(ice_servers) = val
+        let Some(ice_servers) = data
             .get("serverHello")
             .and_then(|v| v.get("rtcConfiguration"))
             .and_then(|v| v.get("iceServers"))
@@ -229,224 +182,172 @@ fn get_yandex_creds(link: &str) -> Result<Creds> {
         };
 
         for server in ice_servers {
-            let user = server
+            let username = server
                 .get("username")
                 .and_then(|v| v.as_str())
                 .unwrap_or_default()
                 .to_owned();
-            let pass = server
+            let credential = server
                 .get("credential")
                 .and_then(|v| v.as_str())
                 .unwrap_or_default()
                 .to_owned();
 
-            let urls = server
-                .get("urls")
-                .and_then(|v| v.as_array())
-                .ok_or_else(|| anyhow!("ice urls missing"))?;
+            let Some(urls) = server.get("urls").and_then(|v| v.as_array()) else {
+                continue;
+            };
 
-            for u in urls {
-                let Some(raw_url) = u.as_str() else {
+            for url in urls {
+                let Some(url_value) = url.as_str() else {
                     continue;
                 };
-                if !(raw_url.starts_with("turn:") || raw_url.starts_with("turns:")) {
+                if !url_value.starts_with("turn:") || url_value.contains("transport=tcp") {
                     continue;
                 }
-                if raw_url.contains("transport=tcp") {
-                    continue;
-                }
-                let turn_addr = raw_url
+
+                let turn_address = url_value
                     .split('?')
                     .next()
-                    .unwrap_or(raw_url)
+                    .unwrap_or(url_value)
                     .trim_start_matches("turn:")
                     .trim_start_matches("turns:")
                     .to_owned();
-                return Ok((user, pass, turn_addr));
+
+                // close immediately after receiving needed creds (same behavior as Python callback)
+                let _ = ws.close(None);
+                return Ok((username, credential, turn_address));
             }
         }
     }
 }
 
-fn extract_link_tail(raw: &str, marker: &str) -> String {
-    let tail = raw.split(marker).last().unwrap_or(raw);
-    let mut result = tail.to_owned();
-    if let Some(idx) = result.find(['/', '?', '#']) {
-        result.truncate(idx);
-    }
-    result
+fn disable_udp_connreset_on_windows(_sock: &UdpSocket) {
+    // TODO: add a tiny optional winapi shim for SIO_UDP_CONNRESET if needed.
 }
 
-fn parse_host_port(value: &str) -> Result<(String, u16)> {
-    let mut parts = value.rsplitn(2, ':');
-    let port = parts
-        .next()
-        .ok_or_else(|| anyhow!("port missing"))?
-        .parse::<u16>()
-        .context("bad port")?;
-    let host = parts
-        .next()
-        .ok_or_else(|| anyhow!("host missing"))?
-        .to_owned();
-    Ok((host, port))
-}
+fn run_udp_forwarder(listen_addr: SocketAddr, target_addr: SocketAddr) -> Result<()> {
+    let local_sock = UdpSocket::bind(listen_addr)
+        .with_context(|| format!("failed to bind local socket on {listen_addr}"))?;
+    local_sock
+        .set_nonblocking(false)
+        .context("failed to set blocking mode for local socket")?;
+    local_sock
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .context("failed to set local socket timeout")?;
+    disable_udp_connreset_on_windows(&local_sock);
 
-fn main() -> Result<()> {
-    let args = Args::parse();
+    let remote_sock = UdpSocket::bind("0.0.0.0:0").context("failed to bind upstream socket")?;
+    remote_sock
+        .set_nonblocking(false)
+        .context("failed to set blocking mode for upstream socket")?;
+    remote_sock
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .context("failed to set upstream socket timeout")?;
+    disable_udp_connreset_on_windows(&remote_sock);
 
-    if args.vk_link.is_some() == args.yandex_link.is_some() {
-        return Err(anyhow!(
-            "exactly one of --vk-link or --yandex-link is required"
-        ));
-    }
+    remote_sock
+        .connect(target_addr)
+        .with_context(|| format!("failed to connect upstream UDP socket to {target_addr}"))?;
 
-    let peer_addr: SocketAddr = args
-        .peer_addr
-        .parse()
-        .context("invalid --peer address, expected host:port")?;
-
-    let (link, provider): (String, &str) = if let Some(vk) = &args.vk_link {
-        (extract_link_tail(vk, "join/"), "vk")
-    } else {
-        (
-            extract_link_tail(
-                args.yandex_link
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("missing yandex link"))?,
-                "j/",
-            ),
-            "yandex",
-        )
-    };
-
-    let desired_n = args
-        .n_connections
-        .unwrap_or(if provider == "vk" { 16 } else { 1 });
-    eprintln!("connections requested: {desired_n}");
-
-    if !args.no_dtls {
-        eprintln!("warning: DTLS obfuscation is not implemented yet in this Rust prototype.");
-    }
-
-    if !args.turn_udp {
-        eprintln!("warning: TCP TURN transport is not implemented yet in this Rust prototype.");
-    }
-
-    let (turn_user, turn_pass, mut turn_addr) = if provider == "vk" {
-        get_vk_creds(&link)?
-    } else {
-        get_yandex_creds(&link)?
-    };
-
-    if let Some(host) = &args.turn_host_override {
-        let (_, port) = parse_host_port(&turn_addr)?;
-        turn_addr = format!("{host}:{port}");
-    }
-    if let Some(port) = args.turn_port_override {
-        let (host, _) = parse_host_port(&turn_addr)?;
-        turn_addr = format!("{host}:{port}");
-    }
-
-    eprintln!("TURN credentials acquired for provider={provider}");
+    eprintln!("Forwarder listening on {listen_addr}");
     eprintln!(
-        "TURN user={} turn_addr={} (password length={})",
-        turn_user,
-        turn_addr,
-        turn_pass.len()
+        "Forwarding UDP to {} via local upstream socket {}",
+        target_addr,
+        remote_sock
+            .local_addr()
+            .context("upstream local addr failed")?
     );
 
-    // NOTE: TURN allocation/authentication is not implemented yet.
-    // Current prototype performs direct UDP relay to --peer.
-    let listen = UdpSocket::bind(&args.listen_addr)
-        .with_context(|| format!("failed to bind local socket: {}", args.listen_addr))?;
-    listen
-        .set_read_timeout(Some(Duration::from_millis(500)))
-        .context("failed to set read timeout")?;
-
-    let upstream = UdpSocket::bind("0.0.0.0:0").context("failed to bind upstream socket")?;
-    upstream
-        .connect(peer_addr)
-        .with_context(|| format!("failed to connect upstream UDP to {peer_addr}"))?;
-    upstream
-        .set_read_timeout(Some(Duration::from_millis(500)))
-        .context("failed to set upstream read timeout")?;
-
     let running = Arc::new(AtomicBool::new(true));
-    let running_sig = Arc::clone(&running);
+    let signal_flag = Arc::clone(&running);
     ctrlc::set_handler(move || {
-        running_sig.store(false, Ordering::SeqCst);
+        signal_flag.store(false, Ordering::SeqCst);
     })
-    .context("failed to set ctrl-c handler")?;
+    .context("failed to set Ctrl+C handler")?;
 
-    let (addr_tx, addr_rx) = mpsc::channel::<SocketAddr>();
+    let (client_tx, client_rx) = mpsc::channel::<SocketAddr>();
 
-    let listen_clone = listen.try_clone().context("clone listen failed")?;
-    let upstream_clone = upstream.try_clone().context("clone upstream failed")?;
-    let running1 = Arc::clone(&running);
+    let c2s_local = local_sock
+        .try_clone()
+        .context("failed to clone local socket")?;
+    let c2s_remote = remote_sock
+        .try_clone()
+        .context("failed to clone remote socket")?;
+    let run_c2s = Arc::clone(&running);
+
     let t1 = thread::spawn(move || {
-        let mut buf = [0u8; 1600];
-        while running1.load(Ordering::SeqCst) {
-            match listen_clone.recv_from(&mut buf) {
-                Ok((n, src)) => {
-                    let _ = addr_tx.send(src);
-                    if let Err(err) = upstream_clone.send(&buf[..n]) {
-                        eprintln!("upstream send error: {err}");
-                        break;
+        let mut buf = [0u8; BUF_SIZE];
+        while run_c2s.load(Ordering::SeqCst) {
+            match c2s_local.recv_from(&mut buf) {
+                Ok((n, client_addr)) => {
+                    let _ = client_tx.send(client_addr);
+                    if let Err(err) = c2s_remote.send(&buf[..n]) {
+                        eprintln!("c2s send error: {err}");
                     }
                 }
                 Err(err)
-                    if err.kind() == std::io::ErrorKind::WouldBlock
-                        || err.kind() == std::io::ErrorKind::TimedOut => {}
-                Err(err) => {
-                    eprintln!("listen recv error: {err}");
-                    break;
-                }
+                    if err.kind() == std::io::ErrorKind::TimedOut
+                        || err.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(err) => eprintln!("c2s recv error: {err}"),
             }
         }
     });
 
-    let listen_clone2 = listen.try_clone().context("clone listen2 failed")?;
-    let running2 = Arc::clone(&running);
+    let s2c_local = local_sock
+        .try_clone()
+        .context("failed to clone local socket")?;
+    let run_s2c = Arc::clone(&running);
+
     let t2 = thread::spawn(move || {
-        let mut last_addr: Option<SocketAddr> = None;
-        let mut buf = [0u8; 1600];
-        while running2.load(Ordering::SeqCst) {
-            while let Ok(addr) = addr_rx.try_recv() {
-                last_addr = Some(addr);
+        let mut buf = [0u8; BUF_SIZE];
+        let mut client_addr: Option<SocketAddr> = None;
+
+        while run_s2c.load(Ordering::SeqCst) {
+            while let Ok(addr) = client_rx.try_recv() {
+                client_addr = Some(addr);
             }
 
-            match upstream.recv(&mut buf) {
+            match remote_sock.recv(&mut buf) {
                 Ok(n) => {
-                    if let Some(dst) = last_addr {
-                        if let Err(err) = listen_clone2.send_to(&buf[..n], dst) {
-                            eprintln!("listen send error: {err}");
-                            break;
+                    if let Some(addr) = client_addr {
+                        if let Err(err) = s2c_local.send_to(&buf[..n], addr) {
+                            eprintln!("s2c send error: {err}");
                         }
                     }
                 }
                 Err(err)
-                    if err.kind() == std::io::ErrorKind::WouldBlock
-                        || err.kind() == std::io::ErrorKind::TimedOut => {}
-                Err(err) => {
-                    eprintln!("upstream recv error: {err}");
-                    break;
-                }
+                    if err.kind() == std::io::ErrorKind::TimedOut
+                        || err.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(err) => eprintln!("s2c recv error: {err}"),
             }
         }
     });
 
     let _ = t1.join();
     let _ = t2.join();
-
-    let mut summary = HashMap::new();
-    summary.insert("provider", provider.to_owned());
-    summary.insert("listen", args.listen_addr.clone());
-    summary.insert("peer", peer_addr.to_string());
-    summary.insert("turn", turn_addr);
-
-    eprintln!(
-        "stopped. summary={}",
-        serde_json::to_string(&summary).unwrap_or_else(|_| "{}".to_owned())
-    );
+    eprintln!("Forwarder stopped");
     Ok(())
+}
+
+fn main() -> Result<()> {
+    let args = Args::parse();
+
+    let conference_id = extract_telemost_id(&args.yandex_link);
+    if conference_id.is_empty() {
+        return Err(anyhow!("failed to parse conference ID from --yandex-link"));
+    }
+
+    let (turn_user, turn_cred, turn_addr) = get_yandex_turn_creds(&conference_id)?;
+    eprintln!("Telemost TURN server: {turn_addr}");
+    eprintln!("Telemost TURN username: {turn_user}");
+    eprintln!("Telemost TURN password length: {}", turn_cred.len());
+
+    let listen_addr: SocketAddr = format!("{}:{}", args.listen_host, args.listen_port)
+        .parse()
+        .context("invalid listen host/port")?;
+    let target_addr: SocketAddr = format!("{}:{}", args.target_ip, args.target_port)
+        .parse()
+        .context("invalid target ip/port")?;
+
+    run_udp_forwarder(listen_addr, target_addr)
 }
