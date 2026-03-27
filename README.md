@@ -1,6 +1,6 @@
 # rust-dtls
 
-Rust-реализация UDP-forwarder пары `client/server` под ваш сценарий (с сохранением UDP/QUIC трафика).
+Rust-реализация UDP-forwarder пары `client/server` под ваш сценарий (с сохранением UDP/QUIC трафика), переписанная ближе к Python `asyncio`-модели.
 
 ## Client
 
@@ -13,6 +13,7 @@ Rust-реализация UDP-forwarder пары `client/server` под ваш �
   - local socket принимает от клиента;
   - remote socket `connect()` к target;
   - двунаправленный relay без изменения payload (QUIC-friendly).
+- Для Windows применяется `SIO_UDP_CONNRESET` (если доступен через Winsock), как в вашем Python-примере.
 
 Запуск (прямой UDP-forward, как в вашем Python варианте):
 
