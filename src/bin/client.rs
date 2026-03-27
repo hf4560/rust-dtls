@@ -23,7 +23,7 @@ const BUF_SIZE: usize = 65_535;
 struct Args {
     /// Yandex Telemost link: https://telemost.yandex.ru/j/<ID>
     #[arg(long = "yandex-link")]
-    yandex_link: String,
+    yandex_link: Option<String>,
 
     /// Local UDP listener for Xray/V2Ray
     #[arg(long = "listen-host", default_value = "127.0.0.1")]
@@ -332,22 +332,32 @@ fn run_udp_forwarder(listen_addr: SocketAddr, target_addr: SocketAddr) -> Result
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    let conference_id = extract_telemost_id(&args.yandex_link);
-    if conference_id.is_empty() {
-        return Err(anyhow!("failed to parse conference ID from --yandex-link"));
-    }
-
-    let (turn_user, turn_cred, turn_addr) = get_yandex_turn_creds(&conference_id)?;
-    eprintln!("Telemost TURN server: {turn_addr}");
-    eprintln!("Telemost TURN username: {turn_user}");
-    eprintln!("Telemost TURN password length: {}", turn_cred.len());
-
     let listen_addr: SocketAddr = format!("{}:{}", args.listen_host, args.listen_port)
         .parse()
         .context("invalid listen host/port")?;
     let target_addr: SocketAddr = format!("{}:{}", args.target_ip, args.target_port)
         .parse()
         .context("invalid target ip/port")?;
+
+    if let Some(link) = args.yandex_link {
+        let conference_id = extract_telemost_id(&link);
+        if conference_id.is_empty() {
+            return Err(anyhow!("failed to parse conference ID from --yandex-link"));
+        }
+
+        // Non-blocking for forwarding path: even if Telemost integration fails,
+        // direct UDP forwarding still starts (same behavior as your Python forwarder use-case).
+        thread::spawn(move || match get_yandex_turn_creds(&conference_id) {
+            Ok((turn_user, turn_cred, turn_addr)) => {
+                eprintln!("Telemost TURN server: {turn_addr}");
+                eprintln!("Telemost TURN username: {turn_user}");
+                eprintln!("Telemost TURN password length: {}", turn_cred.len());
+            }
+            Err(err) => eprintln!("Telemost TURN fetch failed: {err}"),
+        });
+    } else {
+        eprintln!("Telemost TURN step skipped (no --yandex-link). Running direct UDP forwarder.");
+    }
 
     run_udp_forwarder(listen_addr, target_addr)
 }
